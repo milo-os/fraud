@@ -9,6 +9,12 @@ spec:
   kind: FraudPolicy
   plural: fraudpolicies
   singular: fraudpolicy
+  subresources:
+    - name: status
+      permissions:
+        - get
+        - update
+        - patch
   permissions:
     - list
     - get

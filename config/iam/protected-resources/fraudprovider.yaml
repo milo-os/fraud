@@ -9,6 +9,12 @@ spec:
   kind: FraudProvider
   plural: fraudproviders
   singular: fraudprovider
+  subresources:
+    - name: status
+      permissions:
+        - get
+        - update
+        - patch
   permissions:
     - list
     - get
