@@ -9,6 +9,12 @@ spec:
   kind: FraudEvaluation
   plural: fraudevaluations
   singular: fraudevaluation
+  subresources:
+    - name: status
+      permissions:
+        - get
+        - update
+        - patch
   permissions:
     - list
     - get
