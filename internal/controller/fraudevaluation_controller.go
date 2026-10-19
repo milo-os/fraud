@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -96,12 +97,22 @@ func (r *FraudEvaluationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// 2a. If evaluation is already completed, skip the pipeline and apply
 	// enforcement (which short-circuits if EnforcementApplied is already set).
 	if eval.Status.Phase == fraudv1alpha1.PhaseCompleted {
-		var policy fraudv1alpha1.FraudPolicy
-		if err := r.Get(ctx, types.NamespacedName{Name: eval.Spec.PolicyRef.Name}, &policy); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to fetch FraudPolicy %q for enforcement: %w", eval.Spec.PolicyRef.Name, err)
+		// Sync first so evaluations enforced before the field existed are backfilled.
+		syncErr := r.syncRiskAssessment(ctx, &eval)
+		if syncErr != nil {
+			// Do not let a failed summary patch delay enforcement.
+			logf.FromContext(ctx).Error(syncErr, "failed to sync risk assessment; continuing to enforcement")
 		}
 
-		return r.applyEnforcement(ctx, &eval, &policy)
+		var policy fraudv1alpha1.FraudPolicy
+		if err := r.Get(ctx, types.NamespacedName{Name: eval.Spec.PolicyRef.Name}, &policy); err != nil {
+			return ctrl.Result{}, errors.Join(syncErr, fmt.Errorf("failed to fetch FraudPolicy %q for enforcement: %w", eval.Spec.PolicyRef.Name, err))
+		}
+
+		res, err := r.applyEnforcement(ctx, &eval, &policy)
+
+		// Return the sync error too, so the backfill is retried.
+		return res, errors.Join(syncErr, err)
 	}
 
 	// 3. Set phase to Running.
@@ -498,6 +509,8 @@ func (r *FraudEvaluationReconciler) applyEnforcement(ctx context.Context, eval *
 		}
 	}
 
+	assessment := riskAssessmentFor(eval)
+
 	// Create or patch PlatformAccess
 	var existing iamv1alpha1.PlatformAccess
 	err := r.Get(ctx, types.NamespacedName{Name: userName}, &existing)
@@ -508,9 +521,10 @@ func (r *FraudEvaluationReconciler) applyEnforcement(ctx context.Context, eval *
 				Annotations: annotations,
 			},
 			Spec: iamv1alpha1.PlatformAccessSpec{
-				UserRef: iamv1alpha1.UserReference{Name: userName},
-				State:   desiredState,
-				Reason:  reason,
+				UserRef:        iamv1alpha1.UserReference{Name: userName},
+				State:          desiredState,
+				Reason:         reason,
+				RiskAssessment: assessment,
 			},
 		}
 		if err := r.Create(ctx, pa, client.FieldOwner(controllerFieldOwner)); err != nil {
@@ -523,6 +537,9 @@ func (r *FraudEvaluationReconciler) applyEnforcement(ctx context.Context, eval *
 		basePA := existing.DeepCopy()
 		existing.Spec.State = desiredState
 		existing.Spec.Reason = reason
+		if riskAssessmentShouldReplace(existing.Spec.RiskAssessment, assessment) {
+			existing.Spec.RiskAssessment = assessment
+		}
 		if annotations != nil {
 			if existing.Annotations == nil {
 				existing.Annotations = make(map[string]string)

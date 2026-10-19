@@ -4,13 +4,17 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
@@ -896,6 +900,239 @@ var _ = Describe("FraudEvaluation Controller", func() {
 
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "eval-no-provider"}, eval)).To(Succeed())
 			Expect(eval.Status.Phase).To(Equal("Error"))
+		})
+
+		// completedEval creates a FraudEvaluation that has already been through the
+		// pipeline, which is the state the ~266 evaluations enforced before risk
+		// assessments existed are in when the controller restarts.
+		completedEval := func(name, user, score, decision string, evaluatedAt time.Time, enforced bool) *fraudv1alpha1.FraudEvaluation {
+			eval := &fraudv1alpha1.FraudEvaluation{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: fraudv1alpha1.FraudEvaluationSpec{
+					UserRef:   fraudv1alpha1.UserReference{Name: user},
+					PolicyRef: fraudv1alpha1.PolicyReference{Name: policyName},
+				},
+			}
+			Expect(k8sClient.Create(ctx, eval)).To(Succeed())
+
+			at := metav1.NewTime(evaluatedAt)
+			eval.Status.Phase = fraudv1alpha1.PhaseCompleted
+			eval.Status.CompositeScore = score
+			eval.Status.Decision = decision
+			eval.Status.EnforcementAction = fraudv1alpha1.EnforcementActionEnforced
+			eval.Status.LastEvaluationTime = &at
+			if enforced {
+				meta.SetStatusCondition(&eval.Status.Conditions, metav1.Condition{
+					Type:    conditionEnforcementApplied,
+					Status:  metav1.ConditionTrue,
+					Reason:  "EnforcementApplied",
+					Message: "applied before risk assessments existed",
+				})
+			}
+			Expect(k8sClient.Status().Update(ctx, eval)).To(Succeed())
+
+			return eval
+		}
+
+		existingAccess := func(user string, state iamv1alpha1.PlatformAccessState, reason string, assessment *iamv1alpha1.RiskAssessment) *iamv1alpha1.PlatformAccess {
+			pa := &iamv1alpha1.PlatformAccess{
+				ObjectMeta: metav1.ObjectMeta{Name: user},
+				Spec: iamv1alpha1.PlatformAccessSpec{
+					UserRef:        iamv1alpha1.UserReference{Name: user},
+					State:          state,
+					Reason:         reason,
+					RiskAssessment: assessment,
+				},
+			}
+			Expect(k8sClient.Create(ctx, pa)).To(Succeed())
+
+			return pa
+		}
+
+		reconcileEval := func(name string) {
+			res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res).To(Equal(reconcile.Result{}), "the risk assessment sync must never requeue")
+		}
+
+		getAccess := func(user string) *iamv1alpha1.PlatformAccess {
+			pa := &iamv1alpha1.PlatformAccess{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: user}, pa)).To(Succeed())
+
+			return pa
+		}
+
+		evalTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+		It("enforcement that creates the PlatformAccess includes the risk assessment", func() {
+			createResources(15, "FailOpen", "AUTO")
+
+			eval := &fraudv1alpha1.FraudEvaluation{
+				ObjectMeta: metav1.ObjectMeta{Name: "eval-ra-create"},
+				Spec: fraudv1alpha1.FraudEvaluationSpec{
+					UserRef:   fraudv1alpha1.UserReference{Name: "user-ra-create"},
+					PolicyRef: fraudv1alpha1.PolicyReference{Name: policyName},
+				},
+			}
+			Expect(k8sClient.Create(ctx, eval)).To(Succeed())
+			reconcileEval("eval-ra-create")
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "eval-ra-create"}, eval)).To(Succeed())
+			pa := getAccess("user-ra-create")
+			Expect(pa.Spec.State).To(Equal(iamv1alpha1.PlatformAccessStateApproved))
+			Expect(pa.Spec.RiskAssessment).NotTo(BeNil())
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal(eval.Status.CompositeScore))
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal("15.00"))
+			Expect(pa.Spec.RiskAssessment.Decision).To(Equal(fraudv1alpha1.DecisionAccepted))
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-create"))
+			Expect(pa.Spec.RiskAssessment.EvaluatedAt).NotTo(BeNil())
+			Expect(pa.Spec.RiskAssessment.EvaluatedAt.Equal(eval.Status.LastEvaluationTime)).To(BeTrue())
+		})
+
+		It("enforcement that patches an existing PlatformAccess includes the risk assessment", func() {
+			createResources(95, "FailOpen", "AUTO")
+			existingAccess("user-ra-patch", iamv1alpha1.PlatformAccessStateApproved, "prior-reason", nil)
+
+			eval := &fraudv1alpha1.FraudEvaluation{
+				ObjectMeta: metav1.ObjectMeta{Name: "eval-ra-patch"},
+				Spec: fraudv1alpha1.FraudEvaluationSpec{
+					UserRef:   fraudv1alpha1.UserReference{Name: "user-ra-patch"},
+					PolicyRef: fraudv1alpha1.PolicyReference{Name: policyName},
+				},
+			}
+			Expect(k8sClient.Create(ctx, eval)).To(Succeed())
+			reconcileEval("eval-ra-patch")
+
+			pa := getAccess("user-ra-patch")
+			Expect(pa.Spec.State).To(Equal(iamv1alpha1.PlatformAccessStateSuspended))
+			Expect(pa.Spec.RiskAssessment).NotTo(BeNil())
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal("95.00"))
+			Expect(pa.Spec.RiskAssessment.Decision).To(Equal(fraudv1alpha1.DecisionDeactivate))
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-patch"))
+		})
+
+		It("backfills an already-enforced evaluation without touching state or reason", func() {
+			createResources(15, "FailOpen", "AUTO")
+			// An admin has since overridden the automated decision.
+			existingAccess("user-ra-backfill", iamv1alpha1.PlatformAccessStateRejected, "rejected by staff", nil)
+			completedEval("eval-ra-backfill", "user-ra-backfill", testLowScore, fraudv1alpha1.DecisionAccepted, evalTime, true)
+
+			reconcileEval("eval-ra-backfill")
+
+			pa := getAccess("user-ra-backfill")
+			Expect(pa.Spec.State).To(Equal(iamv1alpha1.PlatformAccessStateRejected))
+			Expect(pa.Spec.Reason).To(Equal("rejected by staff"))
+			Expect(pa.Spec.RiskAssessment).NotTo(BeNil())
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal(testLowScore), "score is copied as-is, never rescaled")
+			Expect(pa.Spec.RiskAssessment.Decision).To(Equal(fraudv1alpha1.DecisionAccepted))
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-backfill"))
+			Expect(pa.Spec.RiskAssessment.EvaluatedAt.Time.Equal(evalTime)).To(BeTrue())
+		})
+
+		It("backfills even when the referenced policy no longer exists", func() {
+			// No createResources: the policy is missing, which makes the
+			// enforcement path return an error. The sync runs before that.
+			reconciler = &FraudEvaluationReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Registry: registry}
+			existingAccess("user-ra-nopolicy", iamv1alpha1.PlatformAccessStateApproved, "approved", nil)
+			completedEval("eval-ra-nopolicy", "user-ra-nopolicy", "0.20", fraudv1alpha1.DecisionAccepted, evalTime, true)
+
+			// The missing policy still fails the reconcile, as it did before;
+			// the assessment must have been written regardless.
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "eval-ra-nopolicy"}})
+			Expect(err).To(HaveOccurred())
+
+			pa := getAccess("user-ra-nopolicy")
+			Expect(pa.Spec.RiskAssessment).NotTo(BeNil())
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-nopolicy"))
+		})
+
+		It("still enforces, and returns the error, when the summary patch fails", func() {
+			createResources(15, "FailOpen", "AUTO")
+			existingAccess("user-ra-patchfail", iamv1alpha1.PlatformAccessStateRejected, "pending", nil)
+			completedEval("eval-ra-patchfail", "user-ra-patchfail", testLowScore, fraudv1alpha1.DecisionAccepted, evalTime, false)
+
+			// Fail only the first PlatformAccess patch, which is the summary sync.
+			failed := false
+			watchClient, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+			Expect(err).NotTo(HaveOccurred())
+			reconciler.Client = interceptor.NewClient(watchClient, interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if _, ok := obj.(*iamv1alpha1.PlatformAccess); ok && !failed {
+						failed = true
+						return fmt.Errorf("injected patch failure")
+					}
+
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			})
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "eval-ra-patchfail"}})
+			Expect(err).To(MatchError(ContainSubstring("injected patch failure")), "sync error must still surface so the backfill retries")
+			Expect(failed).To(BeTrue())
+
+			pa := getAccess("user-ra-patchfail")
+			Expect(pa.Spec.State).To(Equal(iamv1alpha1.PlatformAccessStateApproved), "enforcement must not wait on the sync")
+
+			eval := &fraudv1alpha1.FraudEvaluation{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "eval-ra-patchfail"}, eval)).To(Succeed())
+			Expect(meta.FindStatusCondition(eval.Status.Conditions, conditionEnforcementApplied)).NotTo(BeNil())
+		})
+
+		It("does not create a PlatformAccess when backfilling", func() {
+			createResources(15, "FailOpen", "AUTO")
+			completedEval("eval-ra-missing", "user-ra-missing", testLowScore, fraudv1alpha1.DecisionAccepted, evalTime, true)
+
+			reconcileEval("eval-ra-missing")
+
+			pa := &iamv1alpha1.PlatformAccess{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "user-ra-missing"}, pa)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected no PlatformAccess, got err=%v", err)
+		})
+
+		It("does not let an older evaluation overwrite a newer assessment", func() {
+			createResources(15, "FailOpen", "AUTO")
+			newer := metav1.NewTime(evalTime.Add(time.Hour))
+			existingAccess("user-ra-newer", iamv1alpha1.PlatformAccessStateApproved, "approved", &iamv1alpha1.RiskAssessment{
+				Score: "0.05", Decision: fraudv1alpha1.DecisionAccepted, EvaluatedAt: &newer, EvaluationName: "eval-ra-newest",
+			})
+			completedEval("eval-ra-older", "user-ra-newer", "0.90", fraudv1alpha1.DecisionReview, evalTime, true)
+
+			reconcileEval("eval-ra-older")
+
+			pa := getAccess("user-ra-newer")
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-newest"))
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal("0.05"))
+		})
+
+		It("replaces an older assessment with a newer evaluation", func() {
+			createResources(15, "FailOpen", "AUTO")
+			older := metav1.NewTime(evalTime.Add(-time.Hour))
+			existingAccess("user-ra-older", iamv1alpha1.PlatformAccessStateApproved, "approved", &iamv1alpha1.RiskAssessment{
+				Score: "0.05", Decision: fraudv1alpha1.DecisionAccepted, EvaluatedAt: &older, EvaluationName: "eval-ra-stale",
+			})
+			completedEval("eval-ra-fresh", "user-ra-older", "0.30", fraudv1alpha1.DecisionReview, evalTime, true)
+
+			reconcileEval("eval-ra-fresh")
+
+			pa := getAccess("user-ra-older")
+			Expect(pa.Spec.RiskAssessment.EvaluationName).To(Equal("eval-ra-fresh"))
+			Expect(pa.Spec.RiskAssessment.Score).To(Equal("0.30"))
+			Expect(pa.Spec.RiskAssessment.Decision).To(Equal(fraudv1alpha1.DecisionReview))
+		})
+
+		It("does not write when the assessment is already current", func() {
+			createResources(15, "FailOpen", "AUTO")
+			at := metav1.NewTime(evalTime)
+			existingAccess("user-ra-equal", iamv1alpha1.PlatformAccessStateApproved, "approved", &iamv1alpha1.RiskAssessment{
+				Score: testLowScore, Decision: fraudv1alpha1.DecisionAccepted, EvaluatedAt: &at, EvaluationName: "eval-ra-equal",
+			})
+			completedEval("eval-ra-equal", "user-ra-equal", testLowScore, fraudv1alpha1.DecisionAccepted, evalTime, true)
+			before := getAccess("user-ra-equal").ResourceVersion
+
+			reconcileEval("eval-ra-equal")
+			reconcileEval("eval-ra-equal")
+
+			Expect(getAccess("user-ra-equal").ResourceVersion).To(Equal(before))
 		})
 	})
 })
