@@ -182,5 +182,5 @@ type FraudPolicyList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&FraudPolicy{}, &FraudPolicyList{})
+	registerTypes(&FraudPolicy{}, &FraudPolicyList{})
 }

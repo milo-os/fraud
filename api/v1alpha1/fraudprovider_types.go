@@ -120,5 +120,5 @@ type FraudProviderList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&FraudProvider{}, &FraudProviderList{})
+	registerTypes(&FraudProvider{}, &FraudProviderList{})
 }
