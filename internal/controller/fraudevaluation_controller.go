@@ -491,7 +491,7 @@ func (r *FraudEvaluationReconciler) applyEnforcement(ctx context.Context, eval *
 		default:
 			if eval.Status.Decision == "" {
 				log.Info("decision not yet observed, requeueing for next reconcile", "eval", eval.Name)
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
 			log.Info("skipping enforcement for unrecognised decision", "decision", eval.Status.Decision)
 			return r.setEnforcementAppliedCondition(ctx, eval, "SkippedUnknownDecision", fmt.Sprintf("Enforcement skipped: unrecognised decision %q", eval.Status.Decision))
